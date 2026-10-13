@@ -56,8 +56,10 @@ def test_snapshot_preserves_geometry_stages_units_and_uploads_manifest_last(tmp_
     assert storage.uploads[keys[1]]["metadata"]["forecast_status"] == "insufficient_history"
     assert storage.uploads[keys[1]]["data"] == []
     manifest = storage.uploads[keys[-1]]
-    assert manifest["tile_count"] == 2
-    assert manifest["forecast_tile_count"] == 1
+    assert manifest["geometries_count"] == 2
+    assert manifest["forecast_geometries_count"] == 1
+    assert manifest["loaded-files"] == ["geometries/tile_0.json", "geometries/tile_1.json"]
+    assert manifest["original_runs"]["forecaster_run_id"] == "run-1"
     for file in manifest["files"]:
         encoded = (Path(result["local_directory"]) / file["file"]).read_bytes()
         assert hashlib.sha256(encoded).hexdigest() == file["sha256"]
@@ -76,6 +78,28 @@ def test_failed_upload_never_writes_completion_marker(tmp_path):
         StacLoaderExporter().export(**export_inputs(tmp_path), storage=storage)
     assert not any(key.endswith("manifest.json") for key in storage.uploads)
     assert not (tmp_path / "export" / "run-1" / "manifest.json").exists()
+
+
+def test_manifest_links_recorded_original_files_and_runs(tmp_path):
+    inputs = export_inputs(tmp_path)
+    inputs["observations"][0].update(last_run_id="collector-1", artifact={
+        "bucket": "terra-bucket", "key": "terra-uc1/test/observations/2026-01-01.json", "sha256": "observed-checksum"})
+    inputs["observations"][1]["last_run_id"] = "collector-2"
+    # A later record is outside this snapshot and must not appear as provenance.
+    inputs["observations"].append({"tile_id": "tile_0", "observation_date": "2026-02-01", "last_run_id": "future-run"})
+    inputs["source_files"] = [{"role": "forecast", "bucket": "terra-bucket",
+                               "key": "terra-uc1/test/forecasts/forecast_2026-01-03.json", "sha256": "forecast-checksum"}]
+    inputs["run_context"] = {"api_job_id": "job-1", "api_run_job_id": "caller-1"}
+    result = StacLoaderExporter().export(**inputs)
+    manifest = json.loads((Path(result["local_directory"]) / "manifest.json").read_text())
+    assert "s3://terra-bucket/terra-uc1/test/observations/2026-01-01.json" in manifest["original-files"]
+    assert "s3://terra-bucket/terra-uc1/test/forecasts/forecast_2026-01-03.json" in manifest["original-files"]
+    assert str(Path(inputs["feature_csvs"]["tile_0"]).resolve()) in manifest["original-files"]
+    assert manifest["original_runs"]["collector_last_run_ids"] == ["collector-1", "collector-2"]
+    assert manifest["original_runs"]["api_run_job_id"] == "caller-1"
+    tile = json.loads((Path(result["local_directory"]) / "geometries/tile_0.json").read_text())
+    assert tile["data"][0]["source_run_id"] == "collector-1"
+    assert tile["data"][0]["source_artifact"]["sha256"] == "observed-checksum"
 
 
 def test_invalid_geometry_rejects_package_before_s3_upload(tmp_path):
@@ -98,6 +122,16 @@ def _pipeline(tmp_path, monkeypatch, storage, *, enabled=True):
 
 def test_pipeline_exports_after_canonical_forecast_without_changing_it(tmp_path, monkeypatch):
     storage = FakeStorage(observations())
+    storage.settings.minio_bucket = "terra-bucket"
+    storage.settings.mongo_database = "terra-db"
+    for record in storage.records:
+        record["last_run_id"] = "original-collector-run"
+        record["artifact"] = {"bucket": "terra-bucket", "key": f"terra-uc1/partner-aoi/observations/{record['observation_date']}.json"}
+    original_upload = storage.upload_json_if_changed
+    def upload(value, *, key):
+        original_upload(value, key=key)
+        return {"bucket": "terra-bucket", "key": key, "sha256": "source-checksum"}
+    storage.upload_json_if_changed = upload
     result = _pipeline(tmp_path, monkeypatch, storage)
     assert result["status"] == "success"
     assert result["stac_loader_export"]["status"] == "published"
@@ -106,6 +140,12 @@ def test_pipeline_exports_after_canonical_forecast_without_changing_it(tmp_path,
     assert keys.index(canonical) < next(i for i, key in enumerate(keys) if "/stac-loader/" in key)
     assert storage.uploads[canonical][0]["CDOM"] == 37
     assert storage.runs[-1]["stac_loader_export"]["status"] == "published"
+    manifest = storage.uploads[result["stac_loader_export"]["manifest_key"]]
+    assert manifest["run_id"] == storage.runs[-1]["run_id"]
+    assert manifest["original_runs"]["mongo_forecaster_run_filter"]["run_id"] == manifest["run_id"]
+    assert manifest["original_runs"]["collector_last_run_ids"] == ["original-collector-run"]
+    assert f"s3://terra-bucket/{canonical}" in manifest["original-files"]
+    assert "s3://terra-bucket/terra-uc1/partner-aoi/preprocessed/features/tile_0.json" in manifest["original-files"]
 
 
 def test_export_failure_does_not_fail_successful_forecast(tmp_path, monkeypatch):

@@ -97,6 +97,7 @@ class StoredForecastPipeline:
         )
         self.run_dir = Path(config.output_root) / _slug(config.run_name)
         self.execution_id = f"forecast-run-{_utc_now().replace(':', '')}-{uuid.uuid4().hex[:8]}"
+        self._loader_feature_artifacts: list[dict[str, Any]] = []
 
     def execute(self) -> dict[str, Any]:
         if self.storage is None:
@@ -191,11 +192,13 @@ class StoredForecastPipeline:
             horizon_days=int(self.config.model_profile.horizon) * int(self.config.model_profile.cadence_days),
             processing_metadata={"version": self.config.model_profile.model_name},
         )
+        forecast_artifact = None
         if self.storage is not None and self.config.publish:
             artifact = self.storage.upload_json_if_changed(
                 rows,
                 key=self.storage.data_key(relative_path=f"forecasts/{forecast_run_id}.json"),
             )
+            forecast_artifact = artifact
             self.storage.upsert_forecasts([{**row, "artifact": artifact} for row in rows], run_id=self.execution_id)
         result = {
             "status": "success",
@@ -218,6 +221,7 @@ class StoredForecastPipeline:
             definition=definition, tiles=tiles, records=records, feature_csvs=feature_csvs,
             inference_tiles=payload.get("tiles", {}), forecast_rows=rows,
             anchor_date=anchor_date, forecast_run_id=forecast_run_id,
+            forecast_artifact=forecast_artifact,
         )
         (self.run_dir / "forecast_run_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         if self.storage is not None and self.config.publish:
@@ -229,12 +233,38 @@ class StoredForecastPipeline:
             return {"status": "disabled"}
         try:
             geometries = None
+            source_files = list(self._loader_feature_artifacts)
+            run_context = {"run_name": self.config.run_name, **self._api_metadata()}
+            forecast_artifact = inputs.pop("forecast_artifact")
+            if forecast_artifact:
+                source_files.append({"role": "forecast", **forecast_artifact})
+            source_files.append({"role": "forecast", "path": str((self.run_dir / "forecasts" / "global_forecasts.json").resolve())})
             if self.config.collection_run_dir:
-                path = Path(self.config.collection_run_dir) / "tiles" / "river_tiles.geojson"
+                collection_root = Path(self.config.collection_run_dir)
+                for relative in ("collection/collection_input_manifest.json", "history/global_history.json", "tiles/tile_records.json"):
+                    source_files.append({"role": "collector_input", "path": str((collection_root / relative).resolve())})
+                manifest = json.loads((collection_root / "collection" / "collection_input_manifest.json").read_text(encoding="utf-8"))
+                if manifest.get("run_id"):
+                    run_context["collector_manifest_run_id"] = manifest["run_id"]
+                run_context["input_source"] = "collector_run_directory"
+                path = collection_root / "tiles" / "river_tiles.geojson"
                 if path.exists():
                     geometries = json.loads(path.read_text(encoding="utf-8"))
+                    source_files.append({"role": "geometry", "path": str(path.resolve())})
             elif self.storage is not None:
                 geometries = self.storage.download_json(key=self.storage.aoi_key(relative_path="tiles/river_tiles.geojson"))
+                bucket = getattr(self.storage.settings, "minio_bucket", None)
+                if bucket:
+                    source_files.append({"role": "aoi_definition", "bucket": bucket,
+                                         "key": self.storage.aoi_key(relative_path="definition.json")})
+                    if geometries is not None:
+                        source_files.append({"role": "geometry", "bucket": bucket,
+                                             "key": self.storage.aoi_key(relative_path="tiles/river_tiles.geojson")})
+                run_context["input_source"] = "shared_storage"
+            if self.storage is not None:
+                run_context["mongo_database"] = getattr(self.storage.settings, "mongo_database", None)
+                run_context["mongo_run_collection"] = "pipeline_runs"
+                run_context["mongo_forecaster_run_filter"] = {"aoi_id": self.config.aoi_id, "run_id": self.execution_id}
             definition = inputs.pop("definition")
             records = inputs.pop("records")
             return StacLoaderExporter().export(
@@ -243,6 +273,7 @@ class StoredForecastPipeline:
                 aoi_definition_hash=definition.get("aoi_definition_hash"), geometries=geometries,
                 observations=records,
                 storage=self.storage if self.config.publish else None,
+                source_files=source_files, run_context=run_context,
                 **inputs,
             )
         except Exception as exc:
@@ -346,6 +377,7 @@ class StoredForecastPipeline:
                     feature_rows,
                     key=self.storage.data_key(relative_path=f"preprocessed/features/{tile_id}.json"),
                 )
+                self._loader_feature_artifacts.append({"role": "preprocessed", "geom_id": tile_id, **artifact})
                 self.storage.upsert_features(
                     [{**row, "artifact": artifact} for row in feature_rows],
                     run_id=self.execution_id,

@@ -72,6 +72,8 @@ class StacLoaderExporter:
         inference_tiles: dict[str, Any], forecast_rows: list[dict[str, Any]],
         model_name: str, geometries: dict[str, Any] | None = None,
         aoi_definition_hash: str | None = None, storage: Any = None,
+        source_files: list[dict[str, Any]] | None = None,
+        run_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         root = output_dir / execution_id
         root.mkdir(parents=True, exist_ok=True)
@@ -88,6 +90,39 @@ class StacLoaderExporter:
                 observed_by_tile.setdefault(str(record["tile_id"]), []).append(record)
         for record in forecast_rows:
             forecasts_by_tile.setdefault(str(record["tile_id"]), []).append(record)
+
+        originals = list(source_files or [])
+        collector_run_ids = set()
+        for record in [*tiles, *[r for group in observed_by_tile.values() for r in group]]:
+            if record.get("last_run_id"):
+                collector_run_ids.add(str(record["last_run_id"]))
+            artifact = record.get("artifact")
+            if isinstance(artifact, dict) and artifact.get("bucket") and artifact.get("key"):
+                originals.append({"role": "collector_input", **{
+                    key: artifact[key] for key in ("bucket", "key", "sha256") if key in artifact
+                }})
+        for tile_id, csv_path in sorted(feature_csvs.items()):
+            originals.append({"role": "model_input", "geom_id": tile_id,
+                              "path": str(Path(csv_path).resolve())})
+        # Only recorded/read sources are listed; never invent collector run
+        # artifact paths or claim to have used unrelated Sentinel-3 files.
+        original_details = []
+        known = set()
+        for original in originals:
+            identity = json.dumps(original, sort_keys=True)
+            if identity not in known:
+                known.add(identity)
+                original_details.append(original)
+        original_paths = sorted({
+            f"s3://{entry['bucket']}/{entry['key']}" if entry.get("bucket") and entry.get("key") else entry["path"]
+            for entry in original_details if (entry.get("bucket") and entry.get("key")) or entry.get("path")
+        })
+        original_runs = {
+            "forecaster_run_id": execution_id,
+            "forecast_run_id": forecast_run_id,
+            "collector_last_run_ids": sorted(collector_run_ids),
+            **(run_context or {}),
+        }
 
         files = []
         prepared = []
@@ -121,6 +156,12 @@ class StacLoaderExporter:
                 }
                 if record.get("stac_item_ids"):
                     row["source_stac_item_ids"] = record["stac_item_ids"]
+                if record.get("last_run_id"):
+                    row["source_run_id"] = str(record["last_run_id"])
+                if isinstance(record.get("artifact"), dict):
+                    row["source_artifact"] = {
+                        key: record["artifact"][key] for key in ("bucket", "key", "sha256") if key in record["artifact"]
+                    }
                 data.append(row)
                 source_values[date] = values
                 if isinstance(record.get("artifact"), dict) and record["artifact"].get("key"):
@@ -164,12 +205,13 @@ class StacLoaderExporter:
                 "last_input_date": inference_tiles.get(tile_id, {}).get("last_input_date"),
                 "start": data[0]["date"] if data else None, "end": data[-1]["date"] if data else None,
                 "aoi_definition_hash": aoi_definition_hash,
+                "original_runs": original_runs,
             }
             if inference_tiles.get(tile_id, {}).get("error"):
                 metadata["forecast_error"] = str(inference_tiles[tile_id]["error"])[:2000]
             payload = {"geom_id": tile_id, "geometry": geometry, "variables": VARIABLES, "data": data, "metadata": metadata}
             encoded = _encode(payload)
-            relative = f"tiles/{tile_id}.json"
+            relative = f"geometries/{tile_id}.json"
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(encoded)
@@ -182,8 +224,12 @@ class StacLoaderExporter:
         manifest = {
             "run_id": execution_id, "aoi_id": aoi_id, "collection_id": "water-pollution",
             "forecast_run_id": forecast_run_id, "forecast_reference_datetime": _timestamp(anchor_date),
-            "generated_at": generated_at, "status": "ready", "tile_count": len(files),
-            "forecast_tile_count": sum(file["forecast_status"] == "success" for file in files),
+            "generated_at": generated_at, "status": "ready", "geometries_count": len(files),
+            "forecast_geometries_count": sum(file["forecast_status"] == "success" for file in files),
+            "loaded-files": [file["file"] for file in files],
+            "original-files": original_paths,
+            "original_file_details": original_details,
+            "original_runs": original_runs,
             "files": files,
         }
         # Upload this completion marker LAST, only after every tile succeeds.
@@ -192,6 +238,6 @@ class StacLoaderExporter:
                 storage.upload_json_if_changed(payload, key=key)
             storage.upload_json_if_changed(manifest, key=prefix + "manifest.json")
         (root / "manifest.json").write_bytes(_encode(manifest))
-        return {"status": "published" if storage is not None else "local_only", "tile_count": len(files),
+        return {"status": "published" if storage is not None else "local_only", "geometries_count": len(files),
                 "prefix": prefix, "manifest_key": prefix + "manifest.json" if storage is not None else None,
                 "local_directory": str(root)}

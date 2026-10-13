@@ -10,7 +10,7 @@ STAC API or MongoDB.
 
 ```text
 terra-bucket/terra-uc1/<aoi_id>/stac-loader/runs/<forecast-execution-id>/
-├── tiles/
+├── geometries/
 │   ├── tile_0.json
 │   ├── tile_1.json
 │   └── ...
@@ -24,7 +24,10 @@ Local copies are under:
 ```
 
 Each execution has its own prefix, including executions with the same forecast
-anchor. The loader can choose its STAC Item ID independently. No `latest`
+anchor. The folder ID is the original forecaster execution ID, identical to
+MongoDB `pipeline_runs.run_id`; a separate export ID is not generated. The
+forecast product ID (such as `forecast_2026-09-21`) is also recorded, linking to
+the existing canonical S3 forecast file. The loader can choose its STAC Item ID independently. No `latest`
 pointer is updated. Historical files at existing prefixes are untouched.
 
 ## Tile JSON contract
@@ -87,9 +90,33 @@ represented as JSON `null`, never `NaN` or infinity.
 
 ## Manifest and completeness
 
-The manifest lists the execution, forecast anchor, collection, expected tile
-count, number of forecasted tiles, each relative file path, S3 key, SHA-256
-checksum, and forecast status. Its `status` is `ready`.
+The manifest lists the execution, forecast anchor, collection,
+`geometries_count`, `forecast_geometries_count`, and `loaded-files` (relative
+paths such as `geometries/tile_0.json`). `loaded-files` identifies files ready
+for the loader; it does not claim they have already been ingested into STAC.
+The `files` array retains each geometry's full S3 key, checksum, and forecast
+status. Its `status` is `ready`.
+
+`original-files` contains deduplicated source references: full `s3://bucket/key`
+paths plus actual local file paths used during this execution. Local paths are
+audit references inside the forecaster environment, not S3 download targets.
+`original_file_details` records their roles, geometry IDs where applicable,
+and source checksums when supplied by storage. Sources include the AOI
+definition, original geometry and tile-record artifacts, observation artifacts,
+preprocessed features, model input CSVs, and forecast output. Only sources
+actually read or referenced by input records are listed; unrelated Sentinel-3
+data and guessed collector run artifacts are not added.
+
+`original_runs` links the forecaster run ID, forecast product ID, caller's run
+name, and available API job/caller IDs. For shared storage, it also identifies
+the MongoDB database, `pipeline_runs` collection, and forecaster run filter.
+`collector_last_run_ids` lists the last collector publishing run IDs retained
+on input observations and tile documents. Those are not necessarily the runs
+that originally acquired each observation: canonical records are upserted.
+Observation rows retain `source_run_id` and `source_artifact` for record-level
+traceability. A local collector manifest's run ID is preserved when present.
+Canonical source paths can be overwritten by later runs; recorded checksums
+and the per-execution export snapshot preserve what can be verified.
 
 All tile payloads are built and validated before uploading. The S3 manifest is
 uploaded last, after every tile upload succeeds. The loader must process only
