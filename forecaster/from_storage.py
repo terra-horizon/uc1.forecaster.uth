@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ import pandas as pd
 from forecaster.core.global_preprocessor import WATER_TARGET_COLS
 from forecaster.inference import AOIInferenceConfig, AOIInferencePipeline, DEFAULT_FEATURE_CSV_NAME, ModelInferenceProfile
 from forecaster.stac_exporter import StacCatalogExporter
+from forecaster.stac_loader_export import StacLoaderExporter
 from forecaster.storage import MongoMinioStore, StorageConnectionError, StorageSettings
 
 
@@ -40,6 +42,7 @@ class StoredForecastConfig:
     api_job_id: str | None = None
     api_run_job_id: str | None = None
     model_profile: ModelInferenceProfile = ModelInferenceProfile()
+    export_stac_loader: bool = True
 
 
 def _utc_now() -> str:
@@ -211,10 +214,42 @@ class StoredForecastPipeline:
             "source": "collector_run_directory" if self.config.collection_run_dir else "shared_storage",
             **self._api_metadata(),
         }
+        result["stac_loader_export"] = self._export_stac_loader(
+            definition=definition, tiles=tiles, records=records, feature_csvs=feature_csvs,
+            inference_tiles=payload.get("tiles", {}), forecast_rows=rows,
+            anchor_date=anchor_date, forecast_run_id=forecast_run_id,
+        )
         (self.run_dir / "forecast_run_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         if self.storage is not None and self.config.publish:
             self.storage.record_run(result, run_id=self.execution_id)
         return result
+
+    def _export_stac_loader(self, **inputs: Any) -> dict[str, Any]:
+        if not self.config.export_stac_loader or os.getenv("STAC_LOADER_EXPORT_ENABLED", "true").lower() in {"0", "false", "no"}:
+            return {"status": "disabled"}
+        try:
+            geometries = None
+            if self.config.collection_run_dir:
+                path = Path(self.config.collection_run_dir) / "tiles" / "river_tiles.geojson"
+                if path.exists():
+                    geometries = json.loads(path.read_text(encoding="utf-8"))
+            elif self.storage is not None:
+                geometries = self.storage.download_json(key=self.storage.aoi_key(relative_path="tiles/river_tiles.geojson"))
+            definition = inputs.pop("definition")
+            records = inputs.pop("records")
+            return StacLoaderExporter().export(
+                output_dir=self.run_dir / "stac_loader", aoi_id=self.config.aoi_id,
+                execution_id=self.execution_id, model_name=self.config.model_profile.model_name,
+                aoi_definition_hash=definition.get("aoi_definition_hash"), geometries=geometries,
+                observations=records,
+                storage=self.storage if self.config.publish else None,
+                **inputs,
+            )
+        except Exception as exc:
+            # The canonical forecast is already persisted. An optional delivery
+            # export must not invalidate it or leave a ready S3 manifest.
+            print(f"[WARN] STAC loader export failed: {type(exc).__name__}: {exc}")
+            return {"status": "failed", "error_type": type(exc).__name__, "error": str(exc)[:2000]}
 
     def _api_metadata(self) -> dict[str, str]:
         """Attach API provenance without changing the CLI/storage contract."""
@@ -338,6 +373,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-publish", action="store_true", help="With --collection-run-dir, keep forecast outputs local and do not require storage credentials.")
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--stac-base-url")
+    parser.add_argument("--no-stac-loader-export", action="store_true", help="Disable the additive per-tile STAC loader export.")
     return parser.parse_args(argv)
 
 
@@ -354,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
             publish=not args.no_publish,
             plot=args.plot,
             stac_base_url=args.stac_base_url,
+            export_stac_loader=not args.no_stac_loader_export,
         )).execute()
     except (StorageConnectionError, ValueError) as exc:
         print(f"Forecast input failed: {exc}")
