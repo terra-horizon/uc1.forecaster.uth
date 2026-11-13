@@ -161,6 +161,44 @@ def test_liveness_does_not_require_storage() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_documentation_supports_proxy_prefix_and_api_key_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "root_path", "/terra/forecaster")
+    monkeypatch.setattr(app, "servers", [])
+    monkeypatch.setattr(app, "openapi_schema", None)
+    for request_prefix in ["", "/terra/forecaster"]:
+        docs = asyncio.run(_client_request("GET", f"{request_prefix}/docs"))
+        assert docs.status_code == 200
+        assert "url: '/terra/forecaster/openapi.json'" in docs.text
+        assert "oauth2RedirectUrl: window.location.origin + '/terra/forecaster/docs/oauth2-redirect'" in docs.text
+        schema = asyncio.run(_client_request("GET", f"{request_prefix}/openapi.json")).json()
+        assert schema["servers"] == [{"url": "/terra/forecaster"}]
+    assert schema["components"]["securitySchemes"]["ForecastAPIKey"] == {
+        "type": "apiKey", "in": "header", "name": "X-API-Key",
+    }
+    for path, method in [("/api/forecast/jobs", "post"), ("/api/forecast/jobs/{job_id}", "get")]:
+        assert schema["paths"][path][method]["security"] == [{"ForecastAPIKey": []}]
+    assert "security" not in schema["paths"]["/health/live"]["get"]
+    assert "security" not in schema["paths"]["/health/ready"]["get"]
+
+
+@pytest.mark.parametrize("request_prefix", ["", "/terra/forecaster"])
+def test_proxy_prefix_supports_health_and_authenticated_jobs(monkeypatch: pytest.MonkeyPatch, request_prefix: str) -> None:
+    store = FakeJobStore()
+    monkeypatch.setattr(app, "root_path", "/terra/forecaster")
+    monkeypatch.setenv("FORECAST_API_TOKEN", "test-token")
+    monkeypatch.setattr("forecaster.api.main.get_job_store", lambda: store)
+    live = asyncio.run(_client_request("GET", f"{request_prefix}/health/live"))
+    assert live.status_code == 200
+    path = f"{request_prefix}/api/forecast/jobs"
+    unauthorized = asyncio.run(_client_request("POST", path, json=VALID_REQUEST))
+    assert unauthorized.status_code == 401
+    submitted = asyncio.run(_client_request("POST", path, json=VALID_REQUEST, headers={"X-API-Key": "test-token"}))
+    assert submitted.status_code == 202
+    polled = asyncio.run(_client_request("GET", f"{path}/{submitted.json()['job_id']}", headers={"X-API-Key": "test-token"}))
+    assert polled.status_code == 200
+    assert polled.json()["job_id"] == submitted.json()["job_id"]
+
+
 def test_readiness_reports_missing_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     from forecaster.storage import StorageConfigurationError
 

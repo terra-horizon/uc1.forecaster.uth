@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Response, Security, status
+from fastapi.security import APIKeyHeader
 from pymongo.errors import PyMongoError
 from starlette.concurrency import run_in_threadpool
 
@@ -60,7 +61,10 @@ def load_job(job_id: str) -> dict | None:
         store.close()
 
 
-def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+api_key = APIKeyHeader(name="X-API-Key", auto_error=False, scheme_name="ForecastAPIKey")
+
+
+def require_api_key(x_api_key: str | None = Security(api_key)) -> None:
     expected = os.getenv("FORECAST_API_TOKEN")
     if not expected:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": "api_configuration_error", "message": "Forecaster API authentication is not configured."})
@@ -117,15 +121,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             executor.store.close()
 
 
-app = FastAPI(title="UC1 Forecaster API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="TERRA UC1 Water Pollutants Forecaster API",
+    version="1.0.0",
+    lifespan=lifespan,
+    description=(
+        "Submit a forecast job for an AOI already published by the collector, then poll its durable status. "
+        "Forecasts read existing MongoDB and object-storage data; they do not trigger satellite collection. "
+        "Authenticate job endpoints with X-API-Key."
+    ),
+    root_path=os.getenv("FORECAST_API_ROOT_PATH", ""),
+    openapi_tags=[
+        {"name": "Forecast", "description": "Asynchronous forecasts from collected AOI observations."},
+        {"name": "Health", "description": "Public liveness and storage readiness checks."},
+    ],
+)
 
 
-@app.get("/health/live", response_model=LivenessResponse)
+@app.get("/health/live", response_model=LivenessResponse, tags=["Health"], summary="Check API liveness")
 async def live() -> LivenessResponse:
     return LivenessResponse()
 
 
-@app.get("/health/ready", response_model=ReadinessResponse)
+@app.get("/health/ready", response_model=ReadinessResponse, tags=["Health"], summary="Check storage readiness",
+         responses={503: {"model": ReadinessResponse, "description": "Storage configuration or a dependency is unavailable."}})
 async def ready(response: Response) -> ReadinessResponse:
     result = await run_in_threadpool(check_readiness)
     if result.status == "not_ready":
@@ -133,7 +152,12 @@ async def ready(response: Response) -> ReadinessResponse:
     return result
 
 
-@app.post("/api/forecast/jobs", response_model=ForecastJobResponse, status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
+@app.post("/api/forecast/jobs", response_model=ForecastJobResponse, status_code=status.HTTP_202_ACCEPTED,
+          dependencies=[Depends(require_api_key)], tags=["Forecast"], summary="Submit a forecast run",
+          description="Returns immediately with a durable job record. An identical payload with the same run_job_id returns the existing job; a changed payload returns 409. Use a new run_job_id to retry a failed run.",
+          responses={401: {"description": "Missing or invalid X-API-Key."},
+                     409: {"description": "run_job_id already belongs to a different request payload."},
+                     503: {"description": "API authentication is not configured or job storage is unavailable."}})
 async def submit_job(request: ForecastJobRequest) -> ForecastJobResponse:
     try:
         document, _created = await run_in_threadpool(create_or_get_job, request.canonical_payload())
@@ -144,7 +168,12 @@ async def submit_job(request: ForecastJobRequest) -> ForecastJobResponse:
     return _job_response(document)
 
 
-@app.get("/api/forecast/jobs/{job_id}", response_model=ForecastJobResponse, dependencies=[Depends(require_api_key)])
+@app.get("/api/forecast/jobs/{job_id}", response_model=ForecastJobResponse, dependencies=[Depends(require_api_key)],
+         tags=["Forecast"], summary="Read forecast run status and result",
+         description="Poll using the job_id returned by submission. Status is queued, running, succeeded, or failed. A failed job still returns HTTP 200; inspect its error object.",
+         responses={401: {"description": "Missing or invalid X-API-Key."},
+                    404: {"description": "Forecast job was not found."},
+                    503: {"description": "API authentication is not configured or job storage is unavailable."}})
 async def get_job(job_id: str) -> ForecastJobResponse:
     try:
         document = await run_in_threadpool(load_job, job_id)

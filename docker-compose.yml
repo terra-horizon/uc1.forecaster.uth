@@ -60,6 +60,8 @@ services:
       MINIO_VERIFY_TLS: ${MINIO_VERIFY_TLS:-true}
       MINIO_CA_BUNDLE: ${MINIO_CA_BUNDLE:-}
       FORECAST_API_TOKEN: ${FORECAST_API_TOKEN:-}
+      # An explicitly empty value keeps direct local Swagger access available.
+      FORECAST_API_ROOT_PATH: ${FORECAST_API_ROOT_PATH-/terra/forecaster}
       FORECAST_JOB_LEASE_SECONDS: ${FORECAST_JOB_LEASE_SECONDS:-86400}
     depends_on:
       forecaster-api-output-init:

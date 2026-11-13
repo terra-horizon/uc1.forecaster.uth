@@ -213,6 +213,7 @@ The API requires the standard storage variables plus its API token:
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `FORECAST_API_TOKEN` | Yes for job endpoints | Shared secret used by `X-API-Key`. |
+| `FORECAST_API_ROOT_PATH` | No | Reverse-proxy prefix for Swagger/OpenAPI; Docker Compose defaults to `/terra/forecaster`. Set explicitly empty for direct local Swagger access. |
 | `FORECAST_JOB_LEASE_SECONDS` | No | Positive worker lease duration in seconds; defaults to `86400`. |
 | `MONGO_URI` | Yes | Application MongoDB URI including database and authentication source. |
 | `MINIO_ENDPOINT` | Yes | S3-compatible object-storage endpoint. |
@@ -222,7 +223,8 @@ The API requires the standard storage variables plus its API token:
 | `MINIO_CA_BUNDLE` | No | Optional CA bundle path inside the container. |
 | `TERRA_AOI_ID` | No for API jobs | Optional default AOI identity used by the CLI pipeline. Each API job supplies its own required `aoi_id`. |
 
-Start locally after creating a private `.env` file:
+Start locally after creating a private `.env` file. For direct local Swagger
+access, set `FORECAST_API_ROOT_PATH=` in that file:
 
 ```bash
 docker compose --env-file .env up --build -d forecaster-api
@@ -243,7 +245,7 @@ http://127.0.0.1:18001
 
 When the service is behind a reverse proxy, prepend the proxy path to every
 endpoint. For example, a proxy may expose the API as
-`https://example.org/forecaster/api/forecast/jobs`.
+`https://example.org/terra/forecaster/api/forecast/jobs`.
 
 FastAPI also provides interactive OpenAPI documentation:
 
@@ -253,5 +255,28 @@ GET /openapi.json
 ```
 
 These paths work directly at the API root. If a reverse proxy exposes the API
-under a path prefix, configure the proxy and application root path accordingly
-for the interactive documentation, or expose the API on a dedicated hostname.
+under a path prefix, set `FORECAST_API_ROOT_PATH` to that prefix. The prepared
+UTH configuration uses `/terra/forecaster`; after the Nginx update, its
+interactive documentation will be available at
+`https://195.251.57.17/terra/forecaster/docs` and its schema at
+`https://195.251.57.17/terra/forecaster/openapi.json`. Use **Authorize** to supply the
+`X-API-Key` for job endpoints; health endpoints remain public.
+
+### Preparing the `/terra/forecaster` deployment
+
+If the deployment's private `.env` already sets `FORECAST_API_ROOT_PATH`, change
+it to `FORECAST_API_ROOT_PATH=/terra/forecaster`. An existing `/forecaster` or
+empty value overrides the new Compose default. Rebuild and recreate the API
+using the production overlay when ready:
+
+```bash
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.uth.yml up --build -d forecaster-api
+```
+
+Configure Nginx to forward `/terra/forecaster/` to
+`http://127.0.0.1:18001/`, stripping the public prefix (a trailing slash on
+`proxy_pass` does this). Redirect the exact `/terra/forecaster` URL to
+`/terra/forecaster/`. The internal healthcheck remains `/health/live`; the
+public liveness URL becomes `/terra/forecaster/health/live`. The application
+routes and container filesystem do not need renaming. Updating the container
+alone does not change the public Nginx routing.
